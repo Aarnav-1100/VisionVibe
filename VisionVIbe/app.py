@@ -1,12 +1,5 @@
 # app.py
-"""
-Streamlit Career Akinator — corrected full app.
 
-Notes:
-- Ensure GEMINI_API_KEY is set in the same terminal before running.
-- Install deps: pip install streamlit google-genai
-- Run: streamlit run app.py
-"""
 
 import os
 import json
@@ -18,32 +11,27 @@ import traceback
 from typing import Any, Dict, Optional
 import streamlit as st
 
-# ------------------------
-# Import google-genai with friendly error
-# ------------------------
+
+
 try:
     from google import genai
     from google.genai import types as genai_types
 except Exception as e:
-    st.set_page_config(page_title="Career Akinator (Gemini)", layout="centered")
-    st.title("Career Akinator — missing dependency")
+    st.set_page_config(page_title="Vision Vibe", layout="centered")
+    st.title("Vision Vibe — missing dependency")
     st.error("Missing required package: `google-genai`.")
     st.info("Install locally with: pip install google-genai")
     st.code(str(e), language="text")
     st.stop()
 
-# ------------------------
-# Configuration
-# ------------------------
+
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "models/gemini-2.5-flash")
 CACHE_DIR = os.getenv("CACHE_DIR", ".cache_llm")
 LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "25"))
 LLM_RETRIES = int(os.getenv("LLM_RETRIES", "1"))
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-# ------------------------
-# Robust response extraction
-# ------------------------
+
 def extract_response_text(resp: Any) -> str:
     if resp is None:
         return ""
@@ -77,9 +65,7 @@ def extract_response_text(resp: Any) -> str:
     except Exception:
         return ""
 
-# ------------------------
-# JSON cleaning/parsing helpers
-# ------------------------
+
 def clean_markdown_json(text: str) -> str:
     if not isinstance(text, str):
         text = str(text)
@@ -135,9 +121,7 @@ def extract_json_from_text(text: str):
         f"Last JSON error: {last_exc}"
     )
 
-# ------------------------
-# Caching
-# ------------------------
+
 def cache_key_from_profile(profile: Dict[str, str]) -> str:
     s = json.dumps(profile, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
@@ -160,9 +144,6 @@ def save_cache(key: str, value: Dict[str, Any]) -> None:
     except Exception:
         pass
 
-# ------------------------
-# GenAI client & call wrappers
-# ------------------------
 def get_gemini_client():
     api_key = os.getenv("GEMINI_API_KEY")
     use_vertex = os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "false").lower() in ("1", "true", "yes")
@@ -211,9 +192,7 @@ def run_llm_with_timeout(fn, args=(), kwargs=None, timeout=LLM_TIMEOUT, max_retr
         time.sleep(1 + attempt * 0.5)
     return {"ok": False, "error": last_error, "attempts": attempt}
 
-# ------------------------
-# PROMPTS (corrected: escaped braces for .format)
-# ------------------------
+
 PROMPT_GENERATE_CAREERS_AND_QUESTIONS = """
 You are a helpful career-suggestion assistant.
 Given the user's short profile, return JSON ONLY in the following format (no extra text):
@@ -262,9 +241,7 @@ Rules:
 - Return valid JSON only.
 """
 
-# ------------------------
-# Streamlit UI
-# ------------------------
+
 st.set_page_config(page_title="Career Akinator (Gemini)", layout="centered")
 st.title("Career Akinator — AI-assisted career suggestions")
 
@@ -469,6 +446,7 @@ if st.session_state.get("generated"):
             st.session_state["answers_submitted"] = False
 
 st.markdown("---")
-st.markdown("Built with ❤️ — uses Gemini API. Keep your GEMINI_API_KEY secret.")
+st.markdown("Built with ❤️")
+
 
 
