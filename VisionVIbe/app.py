@@ -1,20 +1,14 @@
 # app.py
 """
-Streamlit Career Akinator (Gemini-backed)
+Streamlit Career Akinator — full, robust single-file app.
 
 Features:
-- Uses Google GenAI (Gemini) via google-genai SDK (reads GEMINI_API_KEY from environment)
-- Robust parsing of LLM responses (fenced markdown removal, fallback extraction)
-- Threaded LLM calls with timeout & retries to avoid UI freeze
-- Simple file-based caching to reduce API calls
-- Streamlit UI: profile collection -> LLM generates careers+questions -> user answers -> LLM ranks
-
-Before running:
-  pip install streamlit google-genai
-  # set GEMINI_API_KEY in the same terminal:
-  # PowerShell:
-  $Env:GEMINI_API_KEY="YOUR_KEY_HERE"
-  streamlit run app.py
+- Google GenAI (Gemini) via google-genai SDK (reads GEMINI_API_KEY from env)
+- Robust response extraction and JSON cleaning
+- Threaded LLM calls with timeout & retries to avoid blocking the UI
+- File-based caching to reduce API calls
+- Clear error handling and tracebacks shown in UI
+- Session-state protections to avoid duplicate execution
 """
 
 import os
@@ -22,55 +16,58 @@ import json
 import re
 import time
 import hashlib
-import traceback
 import threading
-from typing import Any, Dict, List, Optional, Tuple
+import traceback
+from typing import Any, Dict, List, Optional
 import streamlit as st
 
-# Try import GenAI client
+# ------------------------
+# Attempt to import google-genai, show friendly message if missing
+# ------------------------
 try:
     from google import genai
     from google.genai import types as genai_types
 except Exception as e:
-    st.error("Missing 'google-genai' package. Install with: pip install google-genai")
-    raise
+    st.set_page_config(page_title="Career Akinator (Gemini)", layout="centered")
+    st.title("Career Akinator — missing dependency")
+    st.error("Missing required package: `google-genai`.")
+    st.info("Install locally with: pip install google-genai")
+    st.code(str(e), language="text")
+    st.stop()
 
-# ---------------------------
+# ------------------------
 # Configuration
-# ---------------------------
+# ------------------------
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "models/gemini-2.5-flash")
 CACHE_DIR = os.getenv("CACHE_DIR", ".cache_llm")
-LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "25"))  # seconds
-LLM_RETRIES = int(os.getenv("LLM_RETRIES", "1"))   # retries on failure
-# Create cache dir if not exists
+LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "25"))  # seconds per attempt
+LLM_RETRIES = int(os.getenv("LLM_RETRIES", "1"))   # retry attempts (0..n)
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-# ---------------------------
-# Helpers: robust response extraction & JSON cleaning
-# ---------------------------
-def extract_response_text(resp) -> str:
+# ------------------------
+# Utility: robust extraction of text from GenAI response
+# ------------------------
+def extract_response_text(resp: Any) -> str:
     """
-    Robustly extract text from various shapes of SDK responses.
+    Extract human text from various response shapes returned by google-genai.
     """
     if resp is None:
         return ""
 
-    # If resp has attribute 'text' (callable or property)
+    # Common: resp.text or resp.text()
     if hasattr(resp, "text"):
         maybe = getattr(resp, "text")
         try:
             if callable(maybe):
                 return maybe()
-            else:
-                return str(maybe)
+            return str(maybe)
         except Exception:
-            # fallback to string conversion
             try:
                 return str(maybe)
             except Exception:
                 pass
 
-    # If resp has 'candidates' (older/newer SDK shapes)
+    # Some SDK shapes: resp.candidates -> content -> parts -> text
     if hasattr(resp, "candidates"):
         try:
             parts = []
@@ -86,34 +83,37 @@ def extract_response_text(resp) -> str:
         except Exception:
             pass
 
-    # final fallback: try stringifying the whole object
+    # Fallback stringify
     try:
         return str(resp)
     except Exception:
         return ""
 
+# ------------------------
+# Utility: clean markdown fences and extract JSON
+# ------------------------
 def clean_markdown_json(text: str) -> str:
     """
-    Strip common markdown fencing and whitespace around JSON-like text.
+    Remove Markdown fences and surrounding commentary, return substring starting at first { or [.
     """
     if not isinstance(text, str):
         text = str(text)
     s = text.strip()
 
-    # Remove triple-backtick fences optionally with language tag
-    # e.g. ```json\n{...}\n``` or ```\n[...]\n```
+    # Remove triple-backtick fenced block entirely if present
     fence_match = re.match(r"^```(?:\w+)?\s*(.*)\s*```$", s, flags=re.DOTALL | re.IGNORECASE)
     if fence_match:
-        return fence_match.group(1).strip()
+        s = fence_match.group(1).strip()
+    else:
+        # generic: remove leading ```lang or trailing ```
+        s = re.sub(r"^```[^\n]*\n", "", s)
+        s = re.sub(r"\n```$", "", s)
 
-    # Remove leading descriptive lines until the first { or [
-    # Also remove single-line fences or surrounding backticks
-    s = re.sub(r"^```[^\n]*\n", "", s)
-    s = re.sub(r"\n```$", "", s)
+    # Remove single backticks wrapping
     if s.startswith("`") and s.endswith("`"):
         s = s[1:-1].strip()
 
-    # Find first JSON start
+    # Find first JSON start token
     idx_candidates = [i for i in (s.find("{"), s.find("[")) if i >= 0]
     if idx_candidates:
         idx = min(idx_candidates)
@@ -121,19 +121,20 @@ def clean_markdown_json(text: str) -> str:
 
     return s
 
-def extract_json_from_text(text: str) -> Any:
+def extract_json_from_text(text: str):
     """
-    Try to parse JSON from an LLM response. Raises ValueError with helpful info if it fails.
+    Try to parse JSON robustly from LLM text output.
+    Returns Python object (list/dict) or raises ValueError with debug info.
     """
     cleaned = clean_markdown_json(text)
 
-    # Direct try
+    # Try direct parse
     try:
         return json.loads(cleaned)
     except Exception:
         pass
 
-    # Fallback: find balanced JSON substrings (object or array)
+    # Fallback: extract balanced {...} or [...] substrings
     candidates = []
 
     def find_balanced(s: str, open_ch: str, close_ch: str):
@@ -153,7 +154,6 @@ def extract_json_from_text(text: str) -> Any:
     for cand in find_balanced(cleaned, "[", "]"):
         candidates.append(cand)
 
-    # Try candidates (prefer longer)
     candidates = sorted(set(candidates), key=len, reverse=True)
     last_exc = None
     for cand in candidates:
@@ -165,21 +165,17 @@ def extract_json_from_text(text: str) -> Any:
 
     raise ValueError(
         "Failed to parse JSON from model output.\n\n"
-        f"Cleaned snippet (truncated):\n{cleaned[:2000]!r}\n\n"
-        f"Original raw (truncated):\n{text[:2000]!r}\n\n"
+        f"Cleaned (truncated):\n{cleaned[:2000]!r}\n\n"
+        f"Original (truncated):\n{text[:2000]!r}\n\n"
         f"Last JSON error: {last_exc}"
     )
 
-# ---------------------------
-# Helpers: caching
-# ---------------------------
-def cache_key_from_profile(profile: Dict[str,str]) -> str:
-    """
-    Derive a stable cache key from the profile dictionary.
-    """
+# ------------------------
+# Cache helpers
+# ------------------------
+def cache_key_from_profile(profile: Dict[str, str]) -> str:
     s = json.dumps(profile, sort_keys=True, ensure_ascii=False)
-    h = hashlib.sha256(s.encode("utf-8")).hexdigest()
-    return h
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 def load_cache(key: str) -> Optional[Dict[str, Any]]:
     path = os.path.join(CACHE_DIR, f"{key}.json")
@@ -199,97 +195,94 @@ def save_cache(key: str, value: Dict[str, Any]) -> None:
     except Exception:
         pass
 
-# ---------------------------
-# GenAI client wrapper & safe call runner
-# ---------------------------
+# ------------------------
+# GenAI client + call wrapper
+# ------------------------
 def get_gemini_client():
-    """Create genai.Client with detection of GEMINI_API_KEY or Vertex mode."""
-    # If user explicitly set key in env, use it
+    """
+    Returns a genai.Client configured using GEMINI_API_KEY in env,
+    or Vertex ADC if requested via GOOGLE_GENAI_USE_VERTEXAI.
+    """
     api_key = os.getenv("GEMINI_API_KEY")
     use_vertex = os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "false").lower() in ("1", "true", "yes")
     if api_key:
-        # pass api_key explicit to be safe in some SDK setups
+        # Pass api_key explicitly to avoid SDK ambiguity
         return genai.Client(api_key=api_key)
     if use_vertex:
         project = os.getenv("GOOGLE_CLOUD_PROJECT")
         location = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
         if not project:
-            raise RuntimeError("Vertex mode requested but GOOGLE_CLOUD_PROJECT is not set.")
+            raise RuntimeError("Vertex mode requested but GOOGLE_CLOUD_PROJECT not set.")
         return genai.Client(project=project, location=location, vertexai=True)
-    # if nothing set, genai.Client() will try to find creds, but raise helpful error
+    # Let SDK attempt to discover credentials (will raise helpful error if none)
     return genai.Client()
 
 def call_genai_generate(client, model: str, prompt: str, thinking_budget: int = 0) -> str:
     """
-    Call GenAI and return the textual result. This is a single-call wrapper.
+    Calls client.models.generate_content and returns extracted text.
     """
-    # Build config if available
     try:
         config = genai_types.GenerateContentConfig(
-            thinking_config = genai_types.ThinkingConfig(thinking_budget=thinking_budget)
+            thinking_config=genai_types.ThinkingConfig(thinking_budget=thinking_budget)
         )
         resp = client.models.generate_content(model=model, contents=prompt, config=config)
     except TypeError:
-        # Some sdk versions accept different args
+        # Some SDK versions may not accept config param
         resp = client.models.generate_content(model=model, contents=prompt)
-    # Extract text robustly
     return extract_response_text(resp)
 
-def run_llm_with_timeout(fn, args=(), kwargs=None, timeout=LLM_TIMEOUT, max_retries=LLM_RETRIES) -> Dict[str, Any]:
+def run_llm_with_timeout(fn, args=(), kwargs=None, timeout=LLM_TIMEOUT, max_retries=LLM_RETRIES):
     """
-    Run a blocking function in a background thread with timeout and retries.
-    Returns dict with keys: ok(bool), result(str) or error(str), attempts(int)
+    Run fn(*args, **kwargs) in a background thread with timeout and retries.
+    Returns dict: {ok:bool, result:str or None, error:str or None, attempts:int}
     """
     kwargs = kwargs or {}
     attempt = 0
     last_error = None
     while attempt <= max_retries:
         attempt += 1
-        result_holder = {"result": None, "error": None}
+        holder = {"result": None, "error": None}
 
         def target():
             try:
-                result_holder["result"] = fn(*args, **kwargs)
+                holder["result"] = fn(*args, **kwargs)
             except Exception as e:
-                result_holder["error"] = traceback.format_exc()
+                holder["error"] = traceback.format_exc()
 
-        thread = threading.Thread(target=target, daemon=True)
-        thread.start()
-        thread.join(timeout=timeout)
-        if thread.is_alive():
-            # timed out
+        th = threading.Thread(target=target, daemon=True)
+        th.start()
+        th.join(timeout=timeout)
+        if th.is_alive():
             last_error = f"Timeout after {timeout}s on attempt {attempt}"
-            # thread stays daemon -> will exit on program end; we continue retrying
         else:
-            if result_holder["error"]:
-                last_error = result_holder["error"]
+            if holder["error"]:
+                last_error = holder["error"]
             else:
-                return {"ok": True, "result": result_holder["result"], "attempts": attempt}
+                return {"ok": True, "result": holder["result"], "attempts": attempt}
         time.sleep(1 + attempt * 0.5)
     return {"ok": False, "error": last_error, "attempts": attempt}
 
-# ---------------------------
-# Prompt templates (simple & conservative)
-# ---------------------------
+# ------------------------
+# Prompt templates
+# ------------------------
 PROMPT_GENERATE_CAREERS_AND_QUESTIONS = """
 You are a helpful career-suggestion assistant.
 Given the user's short profile, return JSON ONLY in the following format (no extra text):
 
-{{
+{
   "careers": ["Career 1", "Career 2", "..."],
   "questions": [
-    {{
+    {
       "id":"q1",
       "text":"Short question text",
       "choices": [
-        {{"label":"Yes-style choice", "value": 1.0}},
-        {{"label":"Sometimes choice", "value": 0.5}},
-        {{"label":"No-style choice", "value": 0.0}}
+        {"label":"Yes-style choice", "value": 1.0},
+        {"label":"Sometimes choice", "value": 0.5},
+        {"label":"No-style choice", "value": 0.0}
       ]
-    }},
-    ...
+    }
   ]
-}}
+}
 
 Rules:
 - Return up to {max_careers} careers.
@@ -304,43 +297,40 @@ You are a career-ranking assistant.
 Given candidate careers, the questions (text), and the user's numeric responses (1.0,0.5,0.0),
 return JSON ONLY in this format:
 
-{{
+{
   "ranking": [
-    {{"career":"Career A", "score": 0.87}},
-    ...
+    {"career":"Career A", "score": 0.87}
   ],
   "explanations": [
-    {{"career":"Career A", "explanation": "one-sentence reason why it's a fit"}},
-    ...
+    {"career":"Career A", "explanation": "one-sentence reason why it's a fit"}
   ]
-}}
+}
 
 Rules:
-- Scores: floats between 0.0 and 1.0.
-- Provide a ranking for all candidate careers (higher is better).
+- Scores between 0.0 and 1.0.
+- Provide ranking for all candidate careers (higher = better).
 - Provide explanations for top 3 only.
-- Return valid JSON only. No other commentary.
+- Return valid JSON only.
 """
 
-# ---------------------------
+# ------------------------
 # Streamlit UI
-# ---------------------------
+# ------------------------
 st.set_page_config(page_title="Career Akinator (Gemini)", layout="centered")
 st.title("Career Akinator — AI-assisted career suggestions")
 
-# show whether GEMINI key is visible (safe debug)
 with st.sidebar:
     st.header("Status & Settings")
     st.write("Model:", DEFAULT_MODEL)
-    st.write("LLM timeout (s):", LLM_TIMEOUT)
+    st.write("Cache Dir:", CACHE_DIR)
+    st.write("Timeout (s):", LLM_TIMEOUT)
     st.write("Retries:", LLM_RETRIES)
-    st.write("Cache dir:", CACHE_DIR)
-    # show presence of API key without printing it
     key_present = bool(os.getenv("GEMINI_API_KEY"))
     st.write("GEMINI key present?", "✅" if key_present else "❌ (set GEMINI_API_KEY)")
 
-st.info("Fill the small profile below and press **Generate**. The AI will suggest careers and a few questions.")
+st.info("Enter a short profile and press Generate. The AI will suggest candidate careers and a few questions.")
 
+# Profile form
 with st.form(key="profile_form"):
     col1, col2 = st.columns([2, 1])
     with col1:
@@ -352,156 +342,197 @@ with st.form(key="profile_form"):
         max_questions = st.slider("Max questions", 2, 8, value=5)
     submit = st.form_submit_button("Generate")
 
+# Initialize session flags
+if "generated" not in st.session_state:
+    st.session_state["generated"] = False
+if "last_raw_generate" not in st.session_state:
+    st.session_state["last_raw_generate"] = None
+if "answers_submitted" not in st.session_state:
+    st.session_state["answers_submitted"] = False
+if "last_rank_raw" not in st.session_state:
+    st.session_state["last_rank_raw"] = None
+
+# Handle generate
 if submit:
     profile = {"activities": activities or "", "strengths": strengths or "", "work_style": work_style or ""}
     cache_key = cache_key_from_profile(profile)
     cached = load_cache(cache_key)
+    careers = []
+    questions = []
     if cached:
-        st.success("Loaded suggestions from cache (to save API calls).")
+        st.success("Loaded suggestions from local cache.")
         careers = cached.get("careers", [])
         questions = cached.get("questions", [])
+        st.session_state["generated"] = True
     else:
-        # build prompt
+        # Build prompt
         prompt = PROMPT_GENERATE_CAREERS_AND_QUESTIONS.format(max_careers=max_careers, max_questions=max_questions)
         prompt += "\n\nUser profile:\n"
         prompt += f"- activities: {profile['activities']}\n"
         prompt += f"- strengths: {profile['strengths']}\n"
         prompt += f"- work_style: {profile['work_style']}\n"
 
-        st.info("Calling the AI to generate candidate careers and questions...")
-        client = None
+        # Create client
         try:
             client = get_gemini_client()
         except Exception as e:
-            st.error("Failed to create Gemini client. See message below.")
+            st.error("Failed to create Gemini client. Check GEMINI_API_KEY or Vertex settings.")
             st.code(str(e))
             st.stop()
 
-        # run LLM safely
-        with st.spinner("Generating candidates & questions (this may take a few seconds)..."):
+        # Call LLM safely
+        with st.spinner("Generating candidate careers and questions (AI)..."):
             call = lambda: call_genai_generate(client, DEFAULT_MODEL, prompt)
             out = run_llm_with_timeout(call, timeout=LLM_TIMEOUT, max_retries=LLM_RETRIES)
+
         if not out.get("ok"):
             st.error("AI call failed or timed out.")
             st.code(out.get("error"))
-            st.stop()
+        else:
+            raw = out["result"]
+            st.session_state["last_raw_generate"] = raw
+            st.text("Raw AI output (truncated):")
+            st.code(raw[:2000])
 
-        raw = out["result"]
-        st.text("Raw AI output (truncated):")
-        st.code(raw[:2000])
+            # Try parse JSON
+            try:
+                parsed = extract_json_from_text(raw)
+                if isinstance(parsed, dict):
+                    careers = parsed.get("careers", []) or []
+                    questions = parsed.get("questions", []) or []
+                else:
+                    # If the model returned a list (fallback), treat as careers
+                    if isinstance(parsed, list):
+                        careers = parsed
+                        questions = []
+                # Normalize questions: ensure id,text, choices (3 numeric)
+                norm_qs = []
+                for i, q in enumerate(questions):
+                    qid = q.get("id") or f"q{i+1}"
+                    text = q.get("text") or q.get("question") or ""
+                    choices = q.get("choices") or q.get("options") or []
+                    if len(choices) < 3:
+                        choices = [
+                            {"label": "Yes", "value": 1.0},
+                            {"label": "Sometimes", "value": 0.5},
+                            {"label": "No", "value": 0.0},
+                        ]
+                    # coerce numeric
+                    for ch in choices[:3]:
+                        try:
+                            ch["value"] = float(ch.get("value", 0.0))
+                        except Exception:
+                            ch["value"] = 0.0
+                        ch["label"] = str(ch.get("label", ""))
+                    norm_qs.append({"id": qid, "text": text, "choices": choices[:3]})
+                questions = norm_qs
+                if not careers:
+                    st.warning("AI returned no careers. Using basic fallback list.")
+                    careers = ["Software Engineer", "Data Scientist", "Teacher"]
+                # Save to cache
+                save_cache(cache_key, {"careers": careers, "questions": questions, "profile": profile})
+                st.success("Generated and cached suggestions.")
+                st.session_state["generated"] = True
+            except Exception as e:
+                st.error("Failed to parse AI output as JSON.")
+                st.code(str(e))
+                st.warning("Shown raw output above for debugging.")
+                st.session_state["generated"] = False
 
-        try:
-            parsed = extract_json_from_text(raw)
-            # basic validation and normalization
-            careers = parsed.get("careers", []) if isinstance(parsed, dict) else []
-            questions = parsed.get("questions", []) if isinstance(parsed, dict) else []
-            # ensure choices numeric & count 3
-            norm_questions = []
-            for i, q in enumerate(questions):
-                qid = q.get("id") or f"q{i+1}"
-                text = q.get("text") or q.get("question") or ""
-                choices = q.get("choices") or q.get("options") or []
-                # ensure three choices
-                if len(choices) < 3:
-                    # fallback default
-                    choices = [
-                        {"label": "Yes", "value": 1.0},
-                        {"label": "Sometimes", "value": 0.5},
-                        {"label": "No", "value": 0.0},
-                    ]
-                # coerce numeric values
-                for ch in choices[:3]:
-                    try:
-                        ch["value"] = float(ch.get("value", 0.0))
-                    except Exception:
-                        ch["value"] = 0.0
-                    ch["label"] = str(ch.get("label", ""))
-                norm_questions.append({"id": qid, "text": text, "choices": choices[:3]})
-            questions = norm_questions
-            if not careers:
-                st.warning("AI returned no careers. Using a small fallback list.")
-                careers = ["Software Engineer", "Data Scientist", "Teacher"]
-            # save cache
-            save_cache(cache_key, {"careers": careers, "questions": questions, "profile": profile})
-            st.success("Generated and cached careers & questions.")
-        except Exception as e:
-            st.error("Failed to parse AI output as JSON.")
-            st.code(str(e))
-            st.warning("Shown raw output above for debugging. Try again or adjust the profile.")
-            st.stop()
+# If generated or loaded, show careers & questions
+if st.session_state.get("generated"):
+    # Load from cache (again) or use last generated variables
+    # If this is a rerun, prefer cache
+    profile = {"activities": activities or "", "strengths": strengths or "", "work_style": work_style or ""}
+    cache_key = cache_key_from_profile(profile)
+    cached = load_cache(cache_key)
+    if cached:
+        careers = cached.get("careers", [])
+        questions = cached.get("questions", [])
+    else:
+        careers = careers or []
+        questions = questions or []
 
-    # Present careers and questions to user
     st.markdown("### Candidate careers")
     for i, c in enumerate(careers, start=1):
         st.write(f"{i}. {c}")
 
     st.markdown("---")
     st.markdown("### Questions")
-    response_map = {}
+    response_map: Dict[str, Dict[str, Any]] = {}
     with st.form(key="qa_form"):
         for idx, q in enumerate(questions, start=1):
             st.write(f"**Q{idx}.** {q['text']}")
             opts = [ch["label"] for ch in q["choices"]]
             choice = st.radio(f"Select (Q{idx})", opts, key=f"q_{idx}")
-            # map selected label back to numeric
             sel_index = opts.index(choice)
             numeric = q["choices"][sel_index]["value"]
             response_map[q["id"]] = {"choice_index": sel_index + 1, "value": numeric}
         submitted_answers = st.form_submit_button("Submit Answers")
 
-    if submitted_answers:
-        st.info("Sending answers to AI to produce final ranking...")
-        client = None
+    # Safe submission handling with try/except and session flags
+    if submitted_answers and not st.session_state.get("answers_submitted", False):
+        st.session_state["answers_submitted"] = True
         try:
-            client = get_gemini_client()
-        except Exception as e:
-            st.error("Failed to create Gemini client. See message below.")
-            st.code(str(e))
-            st.stop()
+            st.info("Sending answers to AI to produce final ranking...")
+            try:
+                client = get_gemini_client()
+            except Exception as e:
+                st.error("Failed to create Gemini client. See message below.")
+                st.code(str(e))
+                st.session_state["answers_submitted"] = False
+                st.stop()
 
-        # prepare rank prompt
-        answers_list = [{"id": qid, "question": next((qq["text"] for qq in questions if qq["id"]==qid), ""), "selected_value": resp["value"]} for qid, resp in response_map.items()]
-        prompt_rank = PROMPT_RANK_AND_EXPLAIN + "\n\nCandidate careers:\n"
-        prompt_rank += "\n".join(f"- {c}" for c in careers)
-        prompt_rank += "\n\nUser answers:\n" + json.dumps(answers_list, indent=2)
+            answers_list = [
+                {"id": qid, "question": next((qq["text"] for qq in questions if qq["id"] == qid), ""), "selected_value": resp["value"]}
+                for qid, resp in response_map.items()
+            ]
+            prompt_rank = PROMPT_RANK_AND_EXPLAIN + "\n\nCandidate careers:\n"
+            prompt_rank += "\n".join(f"- {c}" for c in careers)
+            prompt_rank += "\n\nUser answers:\n" + json.dumps(answers_list, indent=2)
 
-        with st.spinner("AI is ranking careers..."):
-            call = lambda: call_genai_generate(client, DEFAULT_MODEL, prompt_rank)
-            out = run_llm_with_timeout(call, timeout=LLM_TIMEOUT, max_retries=LLM_RETRIES)
+            # run ranking LLM call
+            with st.spinner("AI is ranking careers..."):
+                call = lambda: call_genai_generate(client, DEFAULT_MODEL, prompt_rank)
+                out = run_llm_with_timeout(call, timeout=LLM_TIMEOUT, max_retries=LLM_RETRIES)
 
-        if not out.get("ok"):
-            st.error("AI ranking call failed or timed out.")
-            st.code(out.get("error"))
-            st.stop()
+            if not out.get("ok"):
+                st.error("AI ranking call failed or timed out.")
+                st.code(out.get("error"))
+                st.session_state["answers_submitted"] = False
+            else:
+                raw_rank = out["result"]
+                st.session_state["last_rank_raw"] = raw_rank
+                st.text("Raw ranking output (truncated):")
+                st.code(raw_rank[:2000])
+                try:
+                    parsed_rank = extract_json_from_text(raw_rank)
+                    ranking = parsed_rank.get("ranking", []) if isinstance(parsed_rank, dict) else []
+                    explanations = parsed_rank.get("explanations", []) if isinstance(parsed_rank, dict) else []
+                    if not ranking:
+                        st.warning("AI did not return ranking — using fallback.")
+                        ranking = [{"career": c, "score": 0.5} for c in careers]
+                    st.success("Final ranking:")
+                    for i, item in enumerate(ranking, start=1):
+                        career = item.get("career", "Unknown")
+                        score = float(item.get("score", 0.0))
+                        st.write(f"{i}. **{career}** — confidence {score:.2f}")
+                    if explanations:
+                        st.markdown("---")
+                        st.markdown("### Explanations (top picks)")
+                        for ex in explanations[:3]:
+                            st.write(f"- **{ex.get('career')}**: {ex.get('explanation')}")
+                except Exception as e_parse:
+                    st.error("Failed to parse ranking JSON from AI.")
+                    st.code(str(e_parse))
+                    st.warning("Showing raw ranking output for debugging.")
+                    st.code(raw_rank[:4000])
+                    # keep answers_submitted True so the user can inspect
+        except Exception:
+            tb = traceback.format_exc()
+            st.error("An unexpected error occurred while processing your answers.")
+            st.code(tb)
+            st.session_state["answers_submitted"] = False
 
-        raw_rank = out["result"]
-        st.text("Raw ranking output (truncated):")
-        st.code(raw_rank[:2000])
-
-        try:
-            parsed_rank = extract_json_from_text(raw_rank)
-            ranking = parsed_rank.get("ranking", []) if isinstance(parsed_rank, dict) else []
-            explanations = parsed_rank.get("explanations", []) if isinstance(parsed_rank, dict) else []
-            if not ranking:
-                st.warning("AI did not return ranking — using fallback scoring.")
-                # fallback simple heuristic: keep original order with equal score
-                ranking = [{"career": c, "score": 0.5} for c in careers]
-            st.success("Final ranking:")
-            for i, item in enumerate(ranking, start=1):
-                career = item.get("career", "Unknown")
-                score = float(item.get("score", 0.0))
-                st.write(f"{i}. **{career}** — confidence {score:.2f}")
-            if explanations:
-                st.markdown("---")
-                st.markdown("### Explanations (top picks)")
-                for ex in explanations[:3]:
-                    st.write(f"- **{ex.get('career')}**: {ex.get('explanation')}")
-        except Exception as e:
-            st.error("Failed to parse ranking JSON from AI.")
-            st.code(str(e))
-            st.warning("Shown raw ranking output above for debugging.")
-
-# Footer
 st.markdown("---")
-st.markdown("Choose your career wisely! Powered by Google Gemini and Streamlit.")
-
+st.markdown("Built with ❤️ — uses Gemini API. Keep your GEMINI_API_KEY secret.")
