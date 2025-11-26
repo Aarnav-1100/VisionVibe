@@ -446,7 +446,8 @@ if st.session_state.get("generated"):
             st.session_state["answers_submitted"] = False
 
 st.markdown("---")
-st.markdown("Built with ❤️")
+st.markdown("MADE BY --->>> ABC")
+
 
 
 
