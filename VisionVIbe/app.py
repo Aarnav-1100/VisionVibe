@@ -1,5 +1,3 @@
-# app.py
-
 
 import os
 import json
@@ -447,6 +445,7 @@ if st.session_state.get("generated"):
 
 st.markdown("---")
 st.markdown("MADE BY --->>> ABC")
+
 
 
 
