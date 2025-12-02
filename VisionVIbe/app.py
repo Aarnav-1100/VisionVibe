@@ -314,8 +314,8 @@ if submit:
         else:
             raw = out["result"]
             st.session_state["last_raw_generate"] = raw
-            st.text("Raw AI output (truncated):")
-            st.code(raw[:2000])
+            #st.text("Raw AI output (truncated):")
+           # st.code(raw[:2000])
             try:
                 parsed = extract_json_from_text(raw)
                 if isinstance(parsed, dict):
@@ -415,8 +415,8 @@ if st.session_state.get("generated"):
             else:
                 raw_rank = out["result"]
                 st.session_state["last_rank_raw"] = raw_rank
-                st.text("Raw ranking output (truncated):")
-                st.code(raw_rank[:2000])
+                #st.text("Raw ranking output (truncated):")
+               # st.code(raw_rank[:2000])
                 try:
                     parsed_rank = extract_json_from_text(raw_rank)
                     ranking = parsed_rank.get("ranking", []) if isinstance(parsed_rank, dict) else []
@@ -447,6 +447,7 @@ if st.session_state.get("generated"):
 
 st.markdown("---")
 st.markdown("MADE BY --->>> ABC")
+
 
 
 
