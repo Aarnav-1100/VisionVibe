@@ -242,8 +242,8 @@ Rules:
 """
 
 
-st.set_page_config(page_title="Career Akinator (Gemini)", layout="centered")
-st.title("Career Akinator — AI-assisted career suggestions")
+st.set_page_config(page_title="Vision Vibe", layout="centered")
+st.title("Vision Vibe")
 
 with st.sidebar:
     st.header("Status & Settings")
@@ -447,6 +447,7 @@ if st.session_state.get("generated"):
 
 st.markdown("---")
 st.markdown("MADE BY --->>> ABC")
+
 
 
 
